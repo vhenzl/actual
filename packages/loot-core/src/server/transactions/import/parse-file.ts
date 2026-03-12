@@ -91,7 +91,7 @@ export async function parseFile(
         return parseCSV(filepath, options);
       case '.ofx':
       case '.qfx':
-        return parseOFX(filepath, options);
+        return parseOFXANZ(filepath, options);
       case '.xml':
         return parseCAMT(filepath, options);
       default:
@@ -257,4 +257,162 @@ async function parseCAMT(
       notes: options.importNotes ? trans.notes : null,
     })),
   };
+}
+
+/**
+ * ANZ-specific copy of parseOFX
+ */
+async function parseOFXANZ(
+  filepath: string,
+  options: ParseFileOptions,
+): Promise<ParseFileResult> {
+  const errors = Array<ParseError>();
+  const contents = await fs.readFile(filepath);
+
+  let data: Awaited<ReturnType<typeof ofx2json>>;
+  try {
+    data = await ofx2json(contents);
+  } catch (err) {
+    errors.push({
+      message: 'Failed importing file',
+      internal: err.stack,
+    });
+    return { errors };
+  }
+
+  return processOFXANZ(data);
+}
+
+async function processOFXANZ(data: Awaited<ReturnType<typeof ofx2json>>): Promise<ParseFileResult> {
+  logger.info('Processing ANZ OFX data');
+  const errors = Array<ParseError>();
+
+  const transactions = data.transactions.map(trans => {
+    const parsedAmount = parseOfxAmount(trans.amount);
+    if (parsedAmount === null) {
+      errors.push({
+        message: `Invalid amount format: ${trans.amount}`,
+        internal: `Failed to parse amount: ${trans.amount}`,
+      });
+    }
+
+    const name = trans.name?.trim() || null;
+    const memo = trans.memo?.trim() || null;
+    let payee = name;
+    let notes = memo;
+
+    // name is not provided at all for the first 3 types
+    // use meno as payee for all 4 types
+    if ([
+      'Credit Interest Paid',
+      'Withholding Tax',
+      'Transfer to Term Deposit',
+      'Term Deposit Principal',
+    ].some(type => memo?.startsWith(type))) {
+      payee = memo;
+      notes = name;
+    }
+
+    const visaTypes = [
+      'Visa Purchase',
+      'Visa Refund',
+    ];
+    if (visaTypes.some(type => memo?.startsWith(type))) {
+      ({ payee, notes } = processVisaTransaction(trans.fitId, name, memo, visaTypes, errors));
+    }
+
+    if (memo?.startsWith('Eft Pos')) {
+      ({ payee, notes } = processEftPosTransaction(trans.fitId, name, memo, errors));
+    }
+
+    return {
+      amount: parsedAmount || 0,
+      imported_id: trans.fitId,
+      date: trans.date,
+      payee_name: payee,
+      imported_payee: payee,
+      notes,
+    };
+  });
+
+  return {
+    errors,
+    transactions,
+  };
+}
+
+function processVisaTransaction(transactionId: string, name: string, memo: string, visaTypes: readonly string[], errors: ParseError[]) {
+  /* Examples:
+    <NAME>xxxx **** **** xxxx Df
+    <MEMO>Visa Purchase  Pak N Save Q
+
+    <NAME>xxxx **** **** xxxx If
+    <MEMO>Visa Purchase  Apple Com Bi
+
+    <NAME>xxxx **** **** xxxx If
+    <MEMO>Visa Purchase 0 90 Adobe Sftw A         0 21 FXAmnt=14.94 FXCurr=AUD FXRate=0.90
+   */
+
+  const re = new RegExp(`^(${visaTypes.join('|')})\\s+(.*)`);
+  const match = memo.match(re);
+  if (!match) {
+    logger.error('Failed to parse Visa memo', memo);
+    errors.push({
+      message: `Invalid memo format for Visa transaction ${transactionId}`,
+      internal: `Failed to parse memo: ${memo}`,
+    });
+    return { payee: name, notes: memo };
+  }
+
+  const memoType = match[1];
+  const memoRest = match[2];
+  const dfif = name.slice(-2).toUpperCase();
+  const cc = name.slice(0, -2).replaceAll('****', '_').replaceAll(' ', '');
+
+  if (memo.includes('FXAmnt=')) {
+    // https://regex101.com/r/sCbSQB/1
+    const re = /^(\d+) (\d+)\s+(.*)\s+(\d+) (\d+)\s+(FXAmnt=.*FXRate=\1\.\2)/;
+    const match = memoRest.match(re);
+    if (!match) {
+      logger.error('Failed to parse Visa memo FX details', memo);
+      errors.push({
+        message: `Invalid memo format for Visa transaction with FX ${transactionId}`,
+        internal: `Failed to parse memo: ${memo}`,
+      });
+      return { payee: name, notes: memo };
+    }
+
+    return {
+      payee: match[3],
+      notes: `${memoType} ${match[6]} FXFee=${match[4]}.${match[5]} #${dfif} #CC${cc}`,
+    }
+  }
+
+  return {
+    payee: memoRest,
+    notes: `${memoType} #${dfif} #CC${cc}`,
+  }
+}
+
+function processEftPosTransaction(transactionId: string, name: string, memo: string, errors: ParseError[]) {
+  /* Example:
+    <NAME>Merchant
+    <MEMO>Eft Pos xxxx******** xxxx   C 241223200344
+   */
+
+  const re = /^(Eft Pos)\s+(\d{4})[*]{8} (\d{4})\s+C\s+(.*)/;
+  const match = memo.match(re);
+  if (!match) {
+    logger.error('Failed to parse Eft Pos memo', memo);
+    errors.push({
+      message: `Invalid memo format for Eft Pos transaction ${transactionId}`,
+      internal: `Failed to parse memo: ${memo}`,
+    });
+    return { payee: name, notes: memo };
+  }
+
+  return {
+    payee: name,
+    notes: `${match[1]} Ref=${match[4]} #CC${match[2]}__${match[3]}`,
+  }
 }
